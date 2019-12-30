@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>intro</title>
+  <style>
+      code{white-space: pre-wrap;}
+      span.smallcaps{font-variant: small-caps;}
+      span.underline{text-decoration: underline;}
+      div.column{display: inline-block; vertical-align: top; width: 50%;}
+  </style>
+  <!--[if lt IE 9]>
+    <script src="//cdnjs.cloudflare.com/ajax/libs/html5shiv/3.7.3/html5shiv-printshiv.min.js"></script>
+  <![endif]-->
+</head>
+<body>
+<h1 id="introduction-to-euronextcme-etl-software">Introduction to Euronext/CME ETL software</h1>
+<p>The goal of the software is to decode historical exchange data for two particular exchanges, data that is delivered by Pico.</p>
+<p>The general transformation process is described in the <a href="ETL.md">Abstract ETL view</a></p>
+<p>The deliverable is a Java CLI application; since the data sources are the same, the underlying exchange formats use the same tools, the project is split into 3 repositories:</p>
+<ul>
+<li>common/ - contains the code representing the transformation process</li>
+<li>md-data-reader-euronext/ - contains the specific adapters &amp; main function for Euronext, as well as integration tests</li>
+<li>md-data-reader-cme/ - contains the specific adapters &amp; main function for CME, as well as integration tests</li>
+</ul>
+<p>All three are Clojure projects. The main motivation for using Clojure is two-fold: 1. The need to agressively inline code for the various adapters. 2. The reality that, at least for CME, a lot of the adaptation code is similar.</p>
+<p>This repo concerns itself with the following topics: * the master transformation driver * the main PCAP parser * the supporting Java objects * the main Clojure utilities</p>
+<h1 id="abstract-etl-view">Abstract ETL view</h1>
+<p>The simplest description of the project is to take source exchange files and generate target Parquet datasets. Most of the complexity is in the transformation itself.</p>
+<p>An input file represents the Pico format of delivering historical network data. It’s a gzip file containing a dump in the <a href="https://wiki.wireshark.org/Development/LibpcapFileFormat">pcap format</a> [1]</p>
+<p>Each file can be described as having 3 onion-like layers:</p>
+<ul>
+<li>the Pcap layer: contains the all of the various network envelopes (Ethernet, UDP, etc.). The innermost body represents</li>
+<li>the Exchange layer: usually a simple encoding to allow for multiple messages within a single datagram; each message is part of</li>
+<li>the SBE layer: an individual message is an SBE-encoded trade-specific message.</li>
+</ul>
+<p>The application extracts all 3 layers, taking:</p>
+<ul>
+<li>the pcap’s arrival time from the Pcap layer</li>
+<li>the market time from the Exchange layer</li>
+<li>all trade-specific information from the SBE layer</li>
+</ul>
+<p>It then writes the information to parquet datasets representing each message type.</p>
+<p>Since the input files represent the actual network traffic, they contain intermingled trade-specific messages.</p>
+<p>Each trade message type has its own schema, and corresponds to a single parquet dataset.</p>
+<p>More information can be found in the <a href="technical_ETL.md">Technical ETL View</a>.</p>
+<p>[1] For Pico, the header has a different endianness than what local linux tcpdump produces</p>
+<h1 id="technical-etl-view">Technical ETL view</h1>
+<p>Illustrations for the layers:</p>
+<ul>
+<li><img src="pcap_exploration.png" title="fig:" alt="PCAP" /></li>
+<li><a href="blob:https://peregrinetraders.atlassian.net/98002993-367a-466e-afda-3d97934c537b#media-blob-url=true&amp;id=4066f90b-6c89-43e3-9b76-8eb70e90c0b8&amp;collection=contentId-163086390&amp;contextId=163086390&amp;mimeType=image%2Fpng&amp;name=market_data_packet.png&amp;size=47836&amp;width=1458&amp;height=616">How the payload looks like, further</a></li>
+</ul>
+<p>The program represents one big loop that performs the following:</p>
+<ul>
+<li>Stream file via GZIP decompression filter</li>
+<li>instantiate <a href="kaitai_struct.md">KaitaiStruct</a> and stream PcapPacket’s</li>
+<li>for a packet, extract innermost datagram body - represents the binary Exchange layer</li>
+<li>loop through the Exchange layer to extract SBE payloads</li>
+<li>feed each SBE payload into the main Adapter</li>
+</ul>
+<p>Streams are defined in src/java/com/peregrinetraders/streams. The basic workflow is:</p>
+<pre><code> List&lt;File&gt;                     the input source paths
+ V                              GUnzipped Pcap decoding
+ Stream&lt;Pcap&gt;
+ V                              Individual packet extraction
+ Stream&lt;Packet&gt;
+ V                              Pcap Envelope stripping
+ Stream&lt;PacketFrames&gt; 
+ V                              frame decoded according to exchange’s specifications
+ V                              stream flattening
+ Stream&lt;BufferAndOffset&gt; 
+ V                              each individual message processed by the SBE-&gt;Parquet adapter 
+ Parquet</code></pre>
+<p>Each application has to provide: - the source files - the frame decoder - the SBE-&gt;Parquet Sink</p>
+<h3 id="frame-decoder">Frame decoder</h3>
+<p>It is just: <code>Function&lt;PacketBuffer, Stream&lt;BufferAndOffset&gt;&gt;</code>.</p>
+<p>The basis for both input and output is an UnsafeBuffer, the binary payload. The input PacketBuffer represents the innermost PCAP-body, which is the Exchange’s envelope. Each resulting BufferAndOffset is a reference to the same UnsafeBuffer, the starting point of the SBE payload</p>
+<h3 id="sbe-parquet-sink">SBE-&gt;Parquet Sink</h3>
+<p>Simply:</p>
+<pre><code>Consumer&lt;BufferAndOffset&gt;</code></pre>
+<p>This is provided by each main project (md-data-reader-euronext, md-data-reader-cme), and is covered in the <a href="sbe_workflow.md">SBE workflow</a> # KaitaiStruct</p>
+<p><a href="https://kaitai.io">KaitaiStruct</a> is a declarative way to develop binary parsers.</p>
+<p>It could, in theory, define the same logic as SBE tools (who knows, maybe they share some ancestry?).</p>
+<p>It is used here to interpret the Pcap file format. Two reasons: 1. Like SBE, it abstracts away the error-prone binary manipulations into nice Java getters 2. There’s already a standard binary definition of the PCAP protocol!</p>
+<p>A .ksy file describes the binary PCAP format. A code generator generates Java files which encapsulate the binary manipulation.</p>
+<p>Unfortunately, the code does not generate any streaming-friendly format. As such, some manual editing had to happen in the generated Java code, in order to support the streaming case.</p>
+<p>The generated &amp; modified code is present in <code>src/java/com/struct/kaitai</code>. The entry point is <code>Pcap.java</code>.</p>
+<p>The entirety of manipulation is encapsulated in PcapGenerator.java. This module’s responsibility is to publish a Stream of buffers, from the outer binary data. It does this by adapting the Pcap Object into a Stream<Packet>, and for each packet, extracting the inner PacketBuffer by peeling off the network layers <img src="pcap_exploration.png" alt="network layers" />.</p>
+<h1 id="sbe-workflow">SBE workflow</h1>
+<p>The SBE framework is a mature, (almost…) well designed project to support binary market formats.</p>
+<p>The principle is to represent messages as binary payloads, with an XML description of their overall structure.</p>
+<p>The framework provides tools to generate Java parsing code from the XML. There are 2 modes of execution:</p>
+<ol type="1">
+<li>Interpreted mode: the software generates special bytecode from the XML, and then uses that bytecode at runtime in order to walk the binary payload</li>
+<li>Hardcoded mode: the software generates Java classes which encapsulate direct buffer access in the form of getters/setters.</li>
+</ol>
+<p>The second mode is the fastest possible, as the Java compiler should inline the code to the point of simple memory copies. The downside is that it cannot switch XML implementations at runtime. As such, it is up to the application code to generate new Java classes, integrate them, and build a new JAR file.</p>
+<p>Generated classes are to be found in each exchange’s project (md-data-reader-euronext, md-data-reader-cme).</p>
+<h3 id="explaining-the-almost">Explaining the (almost…)</h3>
+<p>While the usage of generated classes is straightforward, an important mention is the usage of multiple repeated groups.</p>
+<p>In the main Decoder, repetitions are handled by inner classes (also called Decoder). However, the handling is <em>not</em> random access. Contrast this to regular getters, which are just getting data from the buffers at specific offsets.</p>
+<p>The main decoder has a limit member, that represents the “end” of its data. When instantiation an inner decoder, the following happens:</p>
+<pre><code>final int limit = parentMessage.limit();
+parentMessage.limit(limit + HEADER_SIZE);</code></pre>
+<p>The “end” of the message changes!</p>
+<p>Worse, when moving the inner decoder’s Iterator:</p>
+<pre><code>offset = parentMessage.limit();
+parentMessage.limit(offset + blockLength);</code></pre>
+<p>So, the inner groups treat the end of the buffer as some sort of pointer, incrementing it by their own block size.</p>
+<p>This efffectively means groups are <strong>NOT</strong> random access, and <strong>STATEFUL</strong>.</p>
+<p>In order to succesfully work with the file, groups need to be accessed in the <strong>SAME</strong> order as defined in the XML schema.</p>
+<h3 id="further-processing">Further processing</h3>
+<p>Once an SBE Header is instantiated, the main program can then dispatch to a specific decoder, instantiate that in turn, and finally feed into an output <a href="adapter.md">adapter function</a></p>
+<h1 id="kaitaistruct">KaitaiStruct</h1>
+<p><a href="https://kaitai.io">KaitaiStruct</a> is a declarative way to develop binary parsers.</p>
+<p>It could, in theory, define the same logic as SBE tools (who knows, maybe they share some ancestry?).</p>
+<p>It is used here to interpret the Pcap file format. Two reasons: 1. Like SBE, it abstracts away the error-prone binary manipulations into nice Java getters 2. There’s already a standard binary definition of the PCAP protocol!</p>
+<p>A .ksy file describes the binary PCAP format. A code generator generates Java files which encapsulate the binary manipulation.</p>
+<p>Unfortunately, the code does not generate any streaming-friendly format. As such, some manual editing had to happen in the generated Java code, in order to support the streaming case.</p>
+<p>The generated &amp; modified code is present in <code>src/java/com/struct/kaitai</code>. The entry point is <code>Pcap.java</code>.</p>
+<p>The entirety of manipulation is encapsulated in PcapGenerator.java. This module’s responsibility is to publish a Stream of buffers, from the outer binary data. It does this by adapting the Pcap Object into a Stream<Packet>, and for each packet, extracting the inner PacketBuffer by peeling off the network layers <img src="pcap_exploration.png" alt="network layers" />.</p>
+<h1 id="adapting-to-parquet">Adapting to Parquet</h1>
+<p>There are 3 aspects to adaptation:</p>
+<ol type="1">
+<li>The general Parquet writing API</li>
+<li>The master adapter</li>
+<li>Clojure inner adapter design</li>
+</ol>
+<h2 id="parquet-low-level-api">Parquet low-level API</h2>
+<p>The low-level Java Parquet API starts with org.apache.parquet.hadoop.ParquetRecordWriter<T>, where T is the object to be written. Please note that a specific writer can only write the same type of object and, transitively, support only one schema.</p>
+<p>The actual writing logic is handled via org.apache.parquet.hadoop.api.WriteSupport<T>.</p>
+<p>An extension of the class can then physically write to Parquet by means of a org.apache.parquet.io.api.RecordConsumer.</p>
+<h2 id="the-master-adapter">The master adapter</h2>
+<p>The responsibilities of the master adapter are:</p>
+<ol type="1">
+<li>Performing the role of a Java Stream Sink, being given a BufferAndOffset.</li>
+<li>Instantiate individual ParquetRecordWriter’s for each message type, and dispatch it to the corresponding adapter</li>
+<li>Provide Parquet adapters.</li>
+</ol>
+<h4 id="anatomy-of-a-master-adapter">Anatomy of a master adapter</h4>
+<p>The common repository provides:</p>
+<pre><code>MasterDriver/masterStream(
+            List&lt;File&gt; pcapFiles, 
+            Function&lt;PacketBuffer, Stream&lt;BufferAndOffset&gt;&gt; frameDecoder, 
+            Consumer&lt;BufferAndOffset&gt; sink)</code></pre>
+<p>The frame decoder is implemented by each main project, in Java.</p>
+<p>So all the main program would do is call this method with the instantiated frameDecoder and a sink.</p>
+<p>A minimal implementation of the Sink would be java.util.function.Consumer<BufferAndOffset> which, in Clojure, looks like this [1]:</p>
+<pre><code>(jconsumer [^BufferAndOffset info]
+                           (let [buffer        (.getBuffer info)
+                                 offset        (.getOffset info)
+                                 header        (.wrap (MessageHeaderDecoder.) buffer offset)
+                                 templateId    (.templateId header)]
+                            (println templateId))) </code></pre>
+<p>In Clojure, resource handling is handled via an RAII-like pattern, so the main adapter is structured as following:</p>
+<pre><code>    (let [... instantiate ParquetRecordWriter&#39;s ...
+          sink-definition-using-writers (... as above... )
+          project-specific-frame-decoder (new ...)]
+    (try 
+     (MasterDriver/masterStream pcap_files project-specific-frame-decoder sink-definition-using-writers)
+     (finally
+      ... clean up record writers ...)))</code></pre>
+<h4 id="parquet-adapter-design">Parquet Adapter design</h4>
+<p>By now, it should be clear that all there is to it is implementing the WriteSupport interface. Several requirements impact the structure of the adapter:</p>
+<ol type="1">
+<li>There have to be a set of fields (market time, packet) time that must be present in each adapter.</li>
+<li>Business logic needs to be inlined for maximum performance.</li>
+<li>The RecordConsumer API is extremely verbose &amp; repetitive, adapter code should be simplified for maintenance.</li>
+</ol>
+<p>All of the support code is in <code>src/clj/pcap_common/macros.clj</code> and <code>src/clj/pcap_common/parquet_util.clj</code></p>
+<p><code>parquet_util</code> handles assembling a proper ParquetWriter from the various components. It also contains 2 basic implementations of WriteSupport, <code>make-loopful-proxy</code> and <code>make-loopless-proxy</code>. The latter implements a flattened adaptation for use in Euronext. The former should be considered the basic implementation.</p>
+<p>Both functions maintain the invariant that there is a top-level schema containing the timestamps, and that they are properly adapted from the OutputRecord. Afterwards, they call their <code>msg-write-fn</code> parameter to complete the actual SBE-&gt;Parquet adaptation.</p>
+<p>Looking at the Java example for the RecordConsumer documentation:</p>
+<pre><code>  startField(&quot;A&quot;, 0)
+   addValue(1)
+   addValue(2)
+  endField(&quot;A&quot;, 0)</code></pre>
+<p>We can see it’s quite verbose to add a single field. There is thus, a Clojure macro, <code>with-field-new</code>, which helps reduce the repetitiveness, while also inlining. The Clojure version looks like:</p>
+<pre><code>(with-field-new rconsumer &quot;arrival_time&quot; 0 (.addLong (.getPacketTimestamp outer-record)))</code></pre>
+<p>[1] JConsumer is a macro simplifying Clojure’s way of implementing an interface</p>
+<h1 id="operational-analysis">Operational analysis</h1>
+<p>The following operational aspects are to be described:</p>
+<ul>
+<li>Running the application, dependencies</li>
+<li>Memory requirements</li>
+<li>CPU behavior</li>
+<li>Disk requirements</li>
+</ul>
+<h3 id="running-the-application">Running the application</h3>
+<p><code>java -jar &lt;jar file&gt; PARAMTERS...</code></p>
+<p>The jar is packaged standalone, so should depend only on openjdk.</p>
+<h3 id="memory-requirements">Memory requirements</h3>
+<p>The software tries to use streaming as much as possible. As such memory requirements are small, to the point of not really needing to configure memory during execution.</p>
+<p>The GZIP part is the only place where streaming is not used, and there is logic to spill to disk in case of out of memory errors. This can happen when the Pico pcap files end up very large, an infrequent, but existing situation.</p>
+<p>AWS configures their compute instances with the 1 CPU- 2GB RAM ration, so the application is designed with this heap size in mind. This means as many instances can be run in parallel as there are CPUs in the machine.</p>
+<p>The application will output a warning message when disk spilling happens. If execution time seems out of control, heap size can be increased in 500MB increments.</p>
+<h3 id="cpu-requirements">CPU requirements</h3>
+<p>The application is <em>single threaded</em>. It’s main CPU-related steps are:</p>
+<ul>
+<li>Decompressing GZIP files</li>
+<li>Main packet processing loop</li>
+<li>Writing Parquet files. At the time of writing, points #1 and #3 occupy more than 70% of CPU time, and cannot be easily parallelised. In fact, step #3 is also dominated by GZIP <em>compression</em> time, so one can say that the application spends most of its time in compression/decompression. A sketch of the division of labour is:</li>
+</ul>
+<figure>
+<img src="pcap_decoder_cpu_profile.png" alt="" /><figcaption>Division of CPU labour</figcaption>
+</figure>
+<h3 id="disk-requirements">Disk requirements</h3>
+<p>The application does not require large amounts of I/O, as it is currently CPU bound.</p>
+<p>In terms of disk space, given a set of input sources, it is advised to have at least 90% of their total file size available for the output parquet dataset. It is true that things like PCAP network envelopes are removed, that extra data was already very well compressed in the first place (due to being tightly packed together), and is replaced by some Parquet metadata.</p>
+<p>There should be a 10GB buffer of space for when the decompression spills from RAM to disk. Note: Largest encountered decompressed size was 3GB, so this is a highly conservative value.</p>
+</body>
+</html>
